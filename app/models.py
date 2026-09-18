@@ -5,7 +5,7 @@ from datetime import datetime
 from enum import Enum
 from typing import List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class EventType(str, Enum):
@@ -39,6 +39,10 @@ class EventResult(BaseModel):
     type: EventType
     status: str = Field(description="ok 或 violation")
     reason: Optional[str] = Field(default=None, description="违规原因，status 为 violation 时给出")
+    cross_chain_conflict: bool = Field(
+        default=False,
+        description="该有效 seal/reseal 事件是否与其他链占用同一 seal_id；单链校验接口恒为 false",
+    )
 
 
 class Violation(BaseModel):
@@ -57,3 +61,72 @@ class ValidateResponse(BaseModel):
     current_seal: Optional[str] = Field(description="当前有效封签编号，未封装时为 null")
     events: List[EventResult] = Field(description="逐事件状态")
     violations: List[Violation] = Field(description="所有违规事件的位置与原因")
+
+
+# ---------------------------------------------------------------------------
+# 批量封签占用检查（/api/v1/seal-chain/batch-validate）
+# ---------------------------------------------------------------------------
+
+
+class ChainEvents(BaseModel):
+    """批次中的一条事件链。"""
+
+    chain_id: str = Field(description="链标识，同一批次内不可重复")
+    events: List[Event] = Field(default_factory=list)
+
+
+class BatchValidateRequest(BaseModel):
+    """批量校验请求：按输入顺序排列的多条带 chain_id 的事件链。"""
+
+    chains: List[ChainEvents] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _chain_id_must_be_unique(self) -> "BatchValidateRequest":
+        seen: set[str] = set()
+        for chain in self.chains:
+            if chain.chain_id in seen:
+                raise ValueError(f"批次内 chain_id 不可重复：{chain.chain_id}")
+            seen.add(chain.chain_id)
+        return self
+
+
+class CrossChainConflict(BaseModel):
+    """跨链封签占用冲突项：对应一个被标为 cross_chain_conflict 的事件。"""
+
+    seal_id: str = Field(description="被不同链重复占用的封签编号")
+    chain_id: str = Field(description="冲突事件所属链")
+    event_index: int = Field(description="冲突事件在该链中的下标（从 0 开始）")
+    first_chain_id: str = Field(description="按批次输入顺序首次占用该 seal_id 的链")
+
+
+class BatchChainResult(ValidateResponse):
+    """单链结果：结构与单链校验接口完全一致，另附 chain_id。
+
+    冲突仅会把对应有效事件的 cross_chain_conflict 置为 true，
+    valid / sealed / violations 等各链自身字段不因跨链冲突改变。
+    """
+
+    chain_id: str = Field(description="链标识，回显请求中的 chain_id")
+
+
+class BatchChainSummary(BaseModel):
+    """批次汇总中的单链条目，按 chain_id 稳定排序。"""
+
+    chain_id: str
+    valid: bool = Field(description="该链自身校验是否通过（不受跨链冲突影响）")
+    conflicts: int = Field(description="该链被标为 cross_chain_conflict 的事件数")
+
+
+class BatchValidateResponse(BaseModel):
+    """批量校验响应。"""
+
+    valid: bool = Field(description="批次是否通过：各链均无违规且不存在任何跨链冲突")
+    chains: List[BatchChainResult] = Field(description="各链原校验结果（按输入顺序）")
+    conflicts: List[CrossChainConflict] = Field(
+        default_factory=list,
+        description="跨链封签占用冲突项，按首次占用链输入顺序排列",
+    )
+    summary: List[BatchChainSummary] = Field(
+        default_factory=list,
+        description="按 chain_id 稳定排序的批次汇总",
+    )
