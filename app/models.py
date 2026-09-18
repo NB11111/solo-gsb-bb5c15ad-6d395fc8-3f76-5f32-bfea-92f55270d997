@@ -39,6 +39,10 @@ class EventResult(BaseModel):
     type: EventType
     status: str = Field(description="ok 或 violation")
     reason: Optional[str] = Field(default=None, description="违规原因，status 为 violation 时给出")
+    conflict: Optional[str] = Field(
+        default=None,
+        description="跨链封签占用冲突标记（cross_chain_conflict），仅批量校验时可能出现",
+    )
 
 
 class Violation(BaseModel):
@@ -57,3 +61,55 @@ class ValidateResponse(BaseModel):
     current_seal: Optional[str] = Field(description="当前有效封签编号，未封装时为 null")
     events: List[EventResult] = Field(description="逐事件状态")
     violations: List[Violation] = Field(description="所有违规事件的位置与原因")
+
+
+class ChainInput(BaseModel):
+    """批量校验中的单条事件链。"""
+
+    chain_id: str = Field(description="事件链标识，用于定位冲突与汇总排序")
+    events: List[Event] = Field(default_factory=list)
+
+
+class BatchValidateRequest(BaseModel):
+    """批量校验请求：多条带 chain_id 的事件链。"""
+
+    chains: List[ChainInput] = Field(default_factory=list)
+
+
+class SealConflict(BaseModel):
+    """跨链封签占用冲突项。"""
+
+    seal_id: str = Field(description="被重复占用的封签编号")
+    chain_id: str = Field(description="本冲突事件所在的链")
+    event_index: int = Field(description="本冲突事件在链内的下标（从 0 开始）")
+    first_chain_id: str = Field(description="批次内首次占用该封签的链")
+
+
+class ChainResult(ValidateResponse):
+    """单链校验结果（与单链校验一致）及其涉及的跨链冲突。"""
+
+    chain_id: str
+    conflicts: List[SealConflict] = Field(
+        default_factory=list, description="该链涉及的跨链封签占用冲突"
+    )
+
+
+class ChainSummary(BaseModel):
+    """单链汇总项。"""
+
+    chain_id: str
+    valid: bool
+    sealed: bool
+    final_custodian: Optional[str]
+    current_seal: Optional[str]
+    violation_count: int = Field(description="链内违规事件数")
+    conflict_count: int = Field(description="该链涉及的跨链冲突事件数")
+
+
+class BatchValidateResponse(BaseModel):
+    """批量校验响应。"""
+
+    valid: bool = Field(description="批次整体是否通过：所有链无违规且无跨链封签冲突")
+    chains: List[ChainResult] = Field(description="按输入顺序的各链校验结果")
+    conflicts: List[SealConflict] = Field(description="全批次跨链封签冲突，按检出顺序排列")
+    summary: List[ChainSummary] = Field(description="按 chain_id 稳定排序的各链汇总")

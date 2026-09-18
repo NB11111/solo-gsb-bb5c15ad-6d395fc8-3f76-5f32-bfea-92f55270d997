@@ -85,6 +85,73 @@ docker compose up --build
 
 > 事件结构不合法（如未知 `type`、缺少 `timestamp`）返回 `422`；语义违规（状态机层面）则在响应的 `violations` 中逐条列出。
 
+### `POST /api/v1/seal-chain/batch-validate`
+
+批量校验多条事件链，并检查**跨链封签占用冲突**。处理流程：
+
+1. 各链先按上述状态机规则**独立校验**（结果与单链接口一致）；
+2. 再按**输入顺序**建立全批次封签占用表（仅统计各链内 `status=ok` 的有效 `seal`/`reseal` 事件，违规事件不参与占用）；
+3. 同一 `seal_id` 被**不同链**的有效 `seal`/`reseal` 事件占用时，两条链的对应事件均标记 `cross_chain_conflict`（同一 `chain_id` 重复出现视为同一链，不计跨链冲突）。
+
+**冲突不改变各链的校验状态**（各链 `valid` / `violations` / 保管人等保持不变），但只要存在冲突（或任一链有违规），批次 `valid` 即为 `false`。
+
+**请求体**
+
+```json
+{
+  "chains": [
+    {"chain_id": "CHAIN-A", "events": [
+      {"type": "seal", "timestamp": "2026-09-18T10:00:00Z", "seal_id": "S001", "custodian": "Alice"}
+    ]},
+    {"chain_id": "CHAIN-B", "events": [
+      {"type": "seal", "timestamp": "2026-09-18T10:00:00Z", "seal_id": "S001", "custodian": "Bob"}
+    ]}
+  ]
+}
+```
+
+**响应示例**（上例中 S001 被两条链先后占用）：
+
+```json
+{
+  "valid": false,
+  "chains": [
+    {
+      "chain_id": "CHAIN-A",
+      "valid": true,
+      "sealed": true,
+      "final_custodian": "Alice",
+      "current_seal": "S001",
+      "events": [
+        {"index": 0, "type": "seal", "status": "ok", "reason": null, "conflict": "cross_chain_conflict"}
+      ],
+      "violations": [],
+      "conflicts": [
+        {"seal_id": "S001", "chain_id": "CHAIN-A", "event_index": 0, "first_chain_id": "CHAIN-A"}
+      ]
+    }
+  ],
+  "conflicts": [
+    {"seal_id": "S001", "chain_id": "CHAIN-A", "event_index": 0, "first_chain_id": "CHAIN-A"},
+    {"seal_id": "S001", "chain_id": "CHAIN-B", "event_index": 0, "first_chain_id": "CHAIN-A"}
+  ],
+  "summary": [
+    {"chain_id": "CHAIN-A", "valid": true, "sealed": true, "final_custodian": "Alice",
+     "current_seal": "S001", "violation_count": 0, "conflict_count": 1},
+    {"chain_id": "CHAIN-B", "valid": true, "sealed": true, "final_custodian": "Bob",
+     "current_seal": "S001", "violation_count": 0, "conflict_count": 1}
+  ]
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `valid` | 批次整体是否通过：所有链无违规**且**无跨链封签冲突 |
+| `chains[]` | 按**输入顺序**的各链校验结果（字段与单链接口一致）+ `chain_id` 与本链冲突列表 |
+| `chains[].events[].conflict` | 跨链冲突标记，涉冲突事件为 `cross_chain_conflict`，否则为 `null` |
+| `conflicts[]` | 全批次冲突项，按检出顺序排列；每项含 `seal_id`、`chain_id`、`event_index`、`first_chain_id`（首次占用链） |
+| `summary[]` | 按 `chain_id` **稳定排序**的各链汇总（`valid` / `sealed` / 保管人 / 当前封签 / 违规数 / 冲突数） |
+
 ### 示例调用
 
 ```bash
@@ -93,6 +160,18 @@ curl -s http://localhost:8000/api/v1/seal-chain/validate \
   -d '{"events": [
         {"type": "seal", "timestamp": "2026-09-18T10:00:00Z", "seal_id": "S001", "custodian": "Alice"},
         {"type": "handover", "timestamp": "2026-09-18T11:00:00Z", "custodian": "Bob"}
+      ]}'
+
+# 批量校验 + 跨链封签占用检查
+curl -s http://localhost:8000/api/v1/seal-chain/batch-validate \
+  -H 'Content-Type: application/json' \
+  -d '{"chains": [
+        {"chain_id": "CHAIN-A", "events": [
+          {"type": "seal", "timestamp": "2026-09-18T10:00:00Z", "seal_id": "S001", "custodian": "Alice"}
+        ]},
+        {"chain_id": "CHAIN-B", "events": [
+          {"type": "seal", "timestamp": "2026-09-18T10:00:00Z", "seal_id": "S001", "custodian": "Bob"}
+        ]}
       ]}'
 ```
 
@@ -111,8 +190,10 @@ app/
   main.py        # FastAPI 入口与路由
   models.py      # 请求 / 响应模型
   validator.py   # 状态机校验核心
+  batch.py       # 批量封签占用检查（跨链冲突）
 tests/
   test_validator.py
+  test_batch.py
 Dockerfile
 docker-compose.yml
 requirements.txt
